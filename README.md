@@ -8,6 +8,8 @@ by Sebastian Böck and Gerhard Widmer
 in Proceedings of the 16th International Conference on Digital Audio Effects
 (DAFx-13), Maynooth, Ireland, September 2013
 
+The paper can be downloaded from <http://phenicx.upf.edu/system/files/publications/Boeck_DAFx-13.pdf>.
+
 Usage
 -----
 `SuperFlux.py input.wav` processes the audio file and writes the detected onsets to a file named input.onsets.txt.
