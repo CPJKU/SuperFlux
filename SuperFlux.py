@@ -523,7 +523,7 @@ class Onset(object):
     Onset Class.
 
     """
-    def __init__(self, activations, fps, online=True):
+    def __init__(self, activations, fps, online=True, sep=''):
         """
         Creates a new Onset object instance with the given activations of the
         ODF (OnsetDetectionFunction). The activations can be read in from a file.
@@ -543,7 +543,7 @@ class Onset(object):
             self.activations = activations
         else:
             # read in the activations from a file
-            self.load(activations)
+            self.load(activations, sep)
 
     def detect(self, threshold, combine=30, pre_avg=100, pre_max=30, post_avg=30, post_max=70, delay=0):
         """
@@ -616,23 +616,30 @@ class Onset(object):
             for pos in self.detections:
                 f.write(str(pos) + '\n')
 
-    def save(self, filename):
+    def save(self, filename, sep):
         """
         Save the onset activations to the given file.
 
         :param filename: the target file name
+        :param sep: separator between activation values
+
+        Note: using an empty separator ('') results in a binary numpy array.
 
         """
-        self.activations.tofile(filename)
+        print filename, sep
+        self.activations.tofile(filename, sep=sep)
 
-    def load(self, filename):
+    def load(self, filename, sep):
         """
         Load the onset activations from the given file.
 
         :param filename: the target file name
+        :param sep: separator between activation values
+
+        Note: using an empty separator ('') results in a binary numpy array.
 
         """
-        self.activations = np.fromfile(filename)
+        self.activations = np.fromfile(filename, sep=sep)
 
 
 def parser():
@@ -657,6 +664,7 @@ def parser():
     p.add_argument('-v', dest='verbose', action='store_true', help='be verbose')
     p.add_argument('-s', dest='save', action='store_true', default=False, help='save the activations of the onset detection functions')
     p.add_argument('-l', dest='load', action='store_true', default=False, help='load the activations of the onset detection functions')
+    p.add_argument('--sep', action='store', default='', help='separater for saving/loading the onset detection functions [default=numpy binary]')
     # online / offline mode
     p.add_argument('--offline', dest='online', action='store_false', default=True, help='operate in offline mode')
     # wav options
@@ -760,7 +768,7 @@ def main():
         # do the processing stuff unless the activations are loaded from file
         if args.load:
             # load the activations from file
-            o = Onset("%s.%s" % (filename, args.odf), args.fps, args.online)
+            o = Onset("%s.%s" % (filename, args.odf), args.fps, args.online, args.sep)
         else:
             # open the wav file
             w = Wav(f)
@@ -794,7 +802,7 @@ def main():
             o = Onset(act, args.fps, args.online)
             if args.save:
                 # save the raw ODF activations
-                o.save("%s.%s" % (filename, args.odf))
+                o.save("%s.%s" % (filename, args.odf), args.sep)
 
         # detect the onsets
         o.detect(args.threshold, args.combine, args.pre_avg, args.pre_max, args.post_avg, args.post_max, args.delay)
