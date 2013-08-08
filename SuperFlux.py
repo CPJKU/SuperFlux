@@ -213,7 +213,7 @@ class Spectrogram(object):
     Spectrogram Class.
 
     """
-    def __init__(self, wav, window_size=2048, fps=200, online=True):
+    def __init__(self, wav, window_size=2048, fps=200, filterbank=None, log=False, mul=1, add=1, online=True):
         """
         Creates a new Spectrogram object instance and performs a STFT on the given audio.
 
@@ -226,13 +226,24 @@ class Spectrogram(object):
         # init some variables
         self.wav = wav
         self.fps = fps
+        if add <= 0:
+            raise ValueError("a positive value must be added before taking the logarithm")
+        if mul <= 0:
+            raise ValueError("a positive value must be multiplied before taking the logarithm")
         # derive some variables
         self.hop_size = float(self.wav.samplerate) / float(self.fps)  # use floats so that seeking works properly
         self.frames = int(self.wav.samples / self.hop_size)
         self.ffts = int(window_size / 2)
         self.bins = int(window_size / 2)  # initial number equal to ffts, can change if filters are used
-        # init STFT matrix
-        self.stft = np.empty([self.frames, self.ffts], np.complex)
+        # init spec matrix
+        if filterbank is None:
+            # init with number of FFT frequency bins
+            self.spec = np.empty([self.frames, self.ffts])
+        else:
+            # init with number of filter bands
+            self.spec = np.empty([self.frames, np.shape(filterbank)[1]])
+            # set number of bins
+            self.bins = np.shape(filterbank)[1]
         # create windowing function
         self.window = np.hanning(window_size)
         # step through all frames
@@ -265,39 +276,18 @@ class Spectrogram(object):
             # multiply the signal with the window function
             signal = signal * self.window
             # perform DFT
-            self.stft[frame] = fft.fft(signal)[:self.ffts]
+            stft = fft.fft(signal)[:self.ffts]
+            # magnitude spec
+            spec = np.abs(stft)
+            # filter if needed
+            if filterbank is not None:
+                spec = np.dot(spec, filterbank)
+            # take the logarithm
+            if log:
+                spec = np.log10(mul * spec + add)
+            # magnitude spectrogram
+            self.spec[frame] = spec
             # next frame
-        # magnitude spectrogram
-        self.spec = np.abs(self.stft)
-
-    def filter(self, filterbank=None):
-        """
-        Filter the magnitude spectrogram with a filterbank.
-
-        :param filterbank: Filter object which includes the filterbank [default=None]
-
-        If no filterbank is given a standard one will be used.
-
-        """
-        if filterbank is None:
-            # construct a standard filterbank
-            filterbank = Filter(ffts=self.ffts, fs=self.wav.samplerate).filterbank
-        # filter the magnitude spectrogram with the filterbank
-        self.spec = np.dot(self.spec, filterbank)
-        # adjust the number of bins
-        self.bins = np.shape(filterbank)[1]
-
-    def log(self, mul=1, add=1):
-        """
-        Take the logarithm of the magnitude spectrogram.
-
-        :param mul: multiply the magnitude spectrogram with given value [default=1]
-        :param add: add the given value to the magnitude spectrogram [default=1]
-
-        """
-        if add <= 0:
-            raise ValueError("a positive value must be added before taking the logarithm")
-        self.spec = np.log10(mul * self.spec + add)
 
 
 class SpectralODF(object):
@@ -693,7 +683,7 @@ def parser():
     # onset detection
     onset = p.add_argument_group('onset detection arguments')
     onset.add_argument('-o', dest='odf', default=None, help='use this onset detection function [superflux,sf,sfc,sft]')
-    onset.add_argument('-t', dest='threshold', action='store', type=float, default=1.25, help='detection threshold')
+    onset.add_argument('-t', dest='threshold', action='store', type=float, default=1.25, help='detection threshold [default=1.25]')
     onset.add_argument('--combine', action='store', type=float, default=30, help='combine onsets within N miliseconds [default=30]')
     onset.add_argument('--pre_avg', action='store', type=float, default=100, help='build average over N previous miliseconds [default=100]')
     onset.add_argument('--pre_max', action='store', type=float, default=30, help='search maximum over N previous miliseconds [default=30]')
@@ -754,6 +744,7 @@ def main():
 
     # init filterbank
     filt = None
+    filterbank = None
 
     # process the files
     for f in files:
@@ -782,18 +773,14 @@ def main():
             # attenuate signal
             if args.att:
                 w.attenuate(args.att)
-            # spectrogram
-            s = Spectrogram(w, args.window, args.fps, args.online)
-            # filter
+            # create filterbank if needed
             if args.filter:
                 # (re-)create filterbank if the samplerate of the audio changes
                 if filt is None or filt.fs != w.samplerate:
                     filt = Filter(args.window / 2, w.samplerate, args.bands, args.fmin, args.fmax, args.equal)
-                # filter the spectrogram
-                s.filter(filt.filterbank)
-            # log
-            if args.log:
-                s.log(args.mul, args.add)
+                    filterbank = filt.filterbank
+            # spectrogram
+            s = Spectrogram(w, args.window, args.fps, filterbank, args.log, args.mul, args.add, args.online)
             # use the spectrogram to create an SpectralODF object
             sodf = SpectralODF(s, args.ratio, args.max_bins, args.diff_frames)
             # perform detection function on the object
