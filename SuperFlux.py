@@ -213,7 +213,7 @@ class Spectrogram(object):
     Spectrogram Class.
 
     """
-    def __init__(self, wav, window_size=2048, fps=200, filterbank=None, log=False, mul=1, add=1, online=True):
+    def __init__(self, wav, window_size=2048, fps=200, filterbank=None, log=False, mul=1, add=1, online=True, block_size=2048):
         """
         Creates a new Spectrogram object instance and performs a STFT on the given audio.
 
@@ -244,6 +244,14 @@ class Spectrogram(object):
             self.spec = np.empty([self.frames, np.shape(filterbank)[1]])
             # set number of bins
             self.bins = np.shape(filterbank)[1]
+            # set the block size
+            if not block_size or block_size > self.frames:
+                block_size = self.frames
+            # init block counter
+            block = 0
+            # init a matrix of that size
+            spec = np.zeros([block_size, self.ffts])
+
         # create windowing function
         self.window = np.hanning(window_size)
         # step through all frames
@@ -277,17 +285,24 @@ class Spectrogram(object):
             signal = signal * self.window
             # perform DFT
             stft = fft.fft(signal)[:self.ffts]
-            # magnitude spec
-            spec = np.abs(stft)
-            # filter if needed
-            if filterbank is not None:
-                spec = np.dot(spec, filterbank)
-            # take the logarithm
-            if log:
-                spec = np.log10(mul * spec + add)
-            # magnitude spectrogram
-            self.spec[frame] = spec
+            # is block wise processing needed?
+            if filterbank is None:
+                # no filtering needed, thus no block wise processing needed
+                self.spec[frame] = np.abs(stft)
+            else:
+                # filter in blocks
+                spec[frame % block_size] = np.abs(stft)
+                # end of a block or end of the signal reached
+                if (frame + 1) / block_size > block or (frame + 1) == self.frames:
+                    start = block * block_size
+                    stop = min(start + block_size, self.frames)
+                    self.spec[start:stop] = np.dot(spec[:stop - start], filterbank)
+                    # increase the block counter
+                    block += 1
             # next frame
+        # take the logarithm
+        if log:
+            np.log10(mul * self.spec + add, out=self.spec)
 
 
 class SpectralODF(object):
@@ -676,6 +691,7 @@ def parser():
     pre.add_argument('--fmax', action='store', default=16000, type=float, help='maximum frequency of filter in Hz [default=16000]')
     pre.add_argument('--bands', action='store', type=int, default=24, help='number of bands per octave [default=24]')
     pre.add_argument('--equal', action='store_true', default=False, help='equalize triangular windows to have equal area')
+    pre.add_argument('--block_size', action='store', default=2048, type=int, help='perform filtering in blocks of N frames [default=2048]')
     # logarithm
     pre.add_argument('--log', action='store_true', default=None, help='logarithmic magnitude')
     pre.add_argument('--mul', action='store', default=1, type=float, help='multiplier (before taking the log) [default=1]')
@@ -780,7 +796,7 @@ def main():
                     filt = Filter(args.window / 2, w.samplerate, args.bands, args.fmin, args.fmax, args.equal)
                     filterbank = filt.filterbank
             # spectrogram
-            s = Spectrogram(w, args.window, args.fps, filterbank, args.log, args.mul, args.add, args.online)
+            s = Spectrogram(w, args.window, args.fps, filterbank, args.log, args.mul, args.add, args.online, args.block_size)
             # use the spectrogram to create an SpectralODF object
             sodf = SpectralODF(s, args.ratio, args.max_bins, args.diff_frames)
             # perform detection function on the object
