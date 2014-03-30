@@ -177,8 +177,6 @@ class Wav(object):
         """
         # read in the audio
         self.samplerate, self.audio = wavfile.read(filename)
-#        # scale the audio values to the range -1...1 depending on the audio type
-#        self.audio = self.audio / float(np.iinfo(self.audio.dtype).max)
         # set the length
         self.samples = np.shape(self.audio)[0]
         self.length = float(self.samples) / self.samplerate
@@ -197,7 +195,8 @@ class Wav(object):
         :param attenuation: attenuation level given in dB
 
         """
-        self.audio /= np.power(np.sqrt(10.), attenuation / 10.)
+        att = np.power(np.sqrt(10.), attenuation / 10.)
+        self.audio = np.asarray(self.audio / att, dtype=self.audio.dtype)
 
     def downmix(self):
         """
@@ -205,14 +204,14 @@ class Wav(object):
 
         """
         if self.channels > 1:
-            self.audio = np.sum(self.audio, -1) / self.channels
+            self.audio = np.mean(self.audio, axis=-1, dtype=self.audio.dtype)
 
     def normalize(self):
         """
         Normalize the audio signal.
 
         """
-        self.audio /= np.max(self.audio)
+        self.audio = self.audio.astype(np.float) / np.max(self.audio)
 
 
 class Spectrogram(object):
@@ -363,38 +362,22 @@ class SpectralODF(object):
         # number of bins used for the maximum filter
         self.max_bins = max_bins
 
-    def diff(self, spec, pos=False, diff_frames=None):
+    def diff(self, spec, pos=False, diff_frames=None, max_bins=None):
         """
         Calculates the difference of the magnitude spectrogram.
-
-        :param spec:        the magnitude spectrogram
-        :param pos:         only keep positive values [default=False]
-        :param diff_frames: calculate the difference to the N-th previous frame
-
-        """
-        diff = np.zeros_like(spec)
-        if diff_frames is None:
-            diff_frames = self.diff_frames
-        assert diff_frames >= 1, 'number of diff_frames must be >= 1'
-        # calculate the diff
-        diff[diff_frames:] = spec[diff_frames:] - spec[0:-diff_frames]
-        # keep only positive values
-        if pos:
-            diff = diff * (diff > 0)
-        return diff
-
-    def max_diff(self, spec, pos=False, diff_frames=None, max_bins=None):
-        """
-        Calculates the difference of k-th frequency bin of the magnitude
-        spectrogram relative to the maximum over m bins (e.g. m=3: k-1, k, k+1)
-        of the N-th previous frame.
 
         :param spec:        the magnitude spectrogram
         :param pos:         only keep positive values
         :param diff_frames: calculate the difference to the N-th previous frame
         :param max_bins:    number of bins over which the maximum is searched
 
-        Note: This method works only properly if the number of bands for the
+        Note: If 'max_bins' is greater than 0, a maximum filter of this size
+              is applied in the frequency deirection. The difference of the
+              k-th frequency bin of the magnitude spectrogram is then
+              calculated relative to the maximum over m bins of the N-th
+              previous frame (e.g. m=3: k-1, k, k+1).
+
+              This method works only properly if the number of bands for the
               filterbank is chosen carefully. A values of 24 (i.e. quarter-tone
               resolution) usually yields good results.
 
@@ -404,100 +387,13 @@ class SpectralODF(object):
         if diff_frames is None:
             diff_frames = self.diff_frames
         assert diff_frames >= 1, 'number of diff_frames must be >= 1'
-        if max_bins is None:
-            max_bins = self.max_bins
-        assert max_bins >= 1, 'range of the maximum filter must be >= 1'
+        # apply the maximum filter if needed
+        if max_bins > 0:
+            max_spec = maximum_filter(spec, size=[1, max_bins])
+        else:
+            max_spec = spec
         # calculate the diff
-        max_spec = maximum_filter(spec, size=[1, max_bins])[0:-diff_frames]
-        diff[diff_frames:] = spec[diff_frames:] - max_spec
-        # keep only positive values
-        if pos:
-            diff *= (diff > 0)
-        return diff
-
-    def corr_diff(self, spec, pos=False, diff_frames=None, corr_bins=None):
-        """
-        Calculates the difference of the magnitude spectrogram relative to the
-        N-th previous frame shifted in frequency to achieve the highest
-        correlation between these two frames.
-
-        :param spec:        the magnitude spectrogram
-        :param pos:         only keep positive values
-        :param diff_frames: calculate the difference to the N-th previous frame
-        :param corr_bins:   maximum number of bins shifted for correlation
-
-        """
-        # init diff matrix
-        diff = np.zeros_like(spec)
-        # number of diff frames
-        if diff_frames is None:
-            diff_frames = self.diff_frames
-        assert diff_frames >= 1, 'number of diff_frames must be >= 1'
-        # correlation shift in bins
-        if corr_bins is None:
-            corr_bins = 1
-        # calculate the diff
-        frames, bins = diff.shape
-        corr = np.zeros((frames, corr_bins * 2 + 1))
-        for f in range(diff_frames, frames):
-            # correlate the frame with the previous one
-            # resulting size = bins * 2 - 1
-            c = np.correlate(spec[f], spec[f - diff_frames], mode='full')
-            # save the middle part
-            centre = len(c) / 2
-            corr[f] = c[centre - corr_bins: centre + corr_bins + 1]
-            # shift the frame for difference calculation according to the
-            # highest peak in correlation
-            bin_offset = corr_bins - np.argmax(corr[f])
-            bin_start = corr_bins + bin_offset
-            bin_stop = bins - 2 * corr_bins + bin_start
-            diff[f, corr_bins:-corr_bins] = spec[f, corr_bins:-corr_bins] - \
-                                            spec[f - diff_frames,
-                                                 bin_start:bin_stop]
-        # keep only positive values
-        if pos:
-            diff *= (diff > 0)
-        return diff
-
-    def track_diff(self, spec, pos=False, diff_frames=None, max_bins=None):
-        """
-        Calculates the difference of the magnitude spectrogram relative to the
-        bin of N-th previous frame with the highest path costs (i.e. along the
-        magnitude trajectory).
-
-        :param spec:        the magnitude spectrogram
-        :param pos:         only keep positive values
-        :param diff_frames: calculate the difference to the N-th previous frame
-        :param max_bins:    number of bins searched for trajectory-tracking
-
-        Notes: This method is slow, since it uses a triple nested for-loop.
-               The number of max_bins is searched in both frequency directions.
-
-        """
-        # init diff matrix
-        diff = np.zeros_like(spec)
-        # number of diff frames
-        if diff_frames is None:
-            diff_frames = self.diff_frames
-        assert diff_frames >= 1, 'number of diff_frames must be >= 1'
-        # number of diff bins
-        if max_bins is None:
-            max_bins = self.max_bins
-        assert max_bins >= 1, 'number of max_bins must be >= 1'
-        # calculate the diff
-        frames, bins = diff.shape
-        for f in range(diff_frames, frames):
-            # process all frames
-            for b in range(max_bins * diff_frames,
-                           bins - max_bins * diff_frames):
-                # process all bins
-                bin_max = b
-                for step in range(1, diff_frames + 1):
-                    # iteratively go backwards
-                    bin_max = np.argmax(spec[f - step, bin_max - max_bins:
-                                             bin_max + max_bins + 1])
-                    bin_max += (b - max_bins)
-                diff[f, b] = spec[f, b] - spec[f - diff_frames, bin_max]
+        diff[diff_frames:] = spec[diff_frames:] - max_spec[0:-diff_frames]
         # keep only positive values
         if pos:
             diff *= (diff > 0)
@@ -514,41 +410,8 @@ class SpectralODF(object):
         Effects (DAFx-13), Maynooth, Ireland, September 2013
 
         """
-        return np.sum(self.max_diff(self.s.spec, pos=True), axis=1)
-
-    def sf(self):
-        """
-        Spectral Flux.
-
-        "Computer Modeling of Sound for Transformation and Synthesis of Musical
-        Signals"
-        Paul Masri
-        PhD thesis, University of Bristol, 1996
-
-        Note: This method is included for comparison.
-
-        """
-        return np.sum(self.diff(self.s.spec, pos=True), axis=1)
-
-    def sfc(self):
-        """
-        Spectral Flux with correlation trajectory tracking stage.
-
-        Note: This method is included for completeness resons only.
-              The superflux() method should be used instead.
-
-        """
-        return np.sum(self.corr_diff(self.s.spec, pos=True), axis=1)
-
-    def sft(self):
-        """
-        Spectral Flux with 'brute-force' trajectory tracking stage.
-
-        Note: This method is included for completeness resons only.
-              The superflux() method should be used instead.
-
-        """
-        return np.sum(self.track_diff(self.s.spec, pos=True), axis=1)
+        return np.sum(self.diff(self.s.spec, pos=True, max_bins=self.max_bins),
+                      axis=1)
 
 
 class Onset(object):
@@ -697,8 +560,6 @@ def parser():
     (DAFx-13), Maynooth, Ireland, September 2013
 
     """)
-    # list of offered ODFs
-    methods = ['superflux', 'sf', 'sfc', 'sft']
     # general options
     p.add_argument('files', metavar='files', nargs='+',
                    help='files to be processed')
@@ -737,8 +598,9 @@ def parser():
     # spec-processing
     pre = p.add_argument_group('pre-processing arguments')
     # filter
-    pre.add_argument('--filter', action='store_true', default=None,
-                     help='filter the magnitude spectrogram with a filterbank')
+    pre.add_argument('--no_filter', dest='filter', action='store_false',
+                     default=True, help='do not filter the magnitude '
+                                        'spectrogram with a filterbank')
     pre.add_argument('--fmin', action='store', default=27.5, type=float,
                      help='minimum frequency of filter '
                           '[Hz, default=%(default)s]')
@@ -753,8 +615,8 @@ def parser():
                      help='perform filtering in blocks of N frames '
                           '[default=%(default)s]')
     # logarithm
-    pre.add_argument('--log', action='store_true', default=None,
-                     help='logarithmic magnitude')
+    pre.add_argument('--no_log', dest='log', action='store_false',
+                     default=True, help='use linear magnitude scale')
     pre.add_argument('--mul', action='store', default=1, type=float,
                      help='multiplier (before taking the log) '
                           '[default=%(default)s]')
@@ -763,8 +625,6 @@ def parser():
                           '[default=%(default)s]')
     # onset detection
     onset = p.add_argument_group('onset detection arguments')
-    onset.add_argument('-o', dest='odf', default=None,
-                       help='use this onset detection function %s' % methods)
     onset.add_argument('-t', dest='threshold', action='store', type=float,
                        default=1.25, help='detection threshold '
                                           '[default=%(default)s]')
@@ -791,16 +651,6 @@ def parser():
                    version='%(prog)spec 1.01 (2014-03-30)')
     # parse arguments
     args = p.parse_args()
-    # use default values if no ODF is given
-    if args.odf is None:
-        args.odf = 'superflux'
-        if args.log is None:
-            args.log = True
-        if args.filter is None:
-            args.filter = True
-    # remove mistyped methods
-    assert args.odf in methods, 'at least one onset detection function must ' \
-                                'be given.'
     # print arguments
     if args.verbose:
         print args
@@ -845,8 +695,7 @@ def main():
         # do the processing stuff unless the activations are loaded from file
         if args.load:
             # load the activations from file
-            o = Onset("%s.%s" % (filename, args.odf), args.fps, args.online,
-                      args.sep)
+            o = Onset("%s.act" % filename, args.fps, args.online, args.sep)
         else:
             # open the wav file
             w = Wav(f)
@@ -873,12 +722,12 @@ def main():
             # use the spectrogram to create an SpectralODF object
             sodf = SpectralODF(s, args.ratio, args.max_bins, args.diff_frames)
             # perform detection function on the object
-            act = getattr(sodf, args.odf)()
+            act = sodf.superflux()
             # create an Onset object with the activations
             o = Onset(act, args.fps, args.online)
             if args.save:
                 # save the raw ODF activations
-                o.save("%s.%s" % (filename, args.odf), args.sep)
+                o.save("%s.act" % filename, args.sep)
         # detect the onsets
         o.detect(args.threshold, args.combine, args.pre_avg, args.pre_max,
                  args.post_avg, args.post_max, args.delay)
