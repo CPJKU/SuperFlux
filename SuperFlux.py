@@ -30,26 +30,23 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 Please note that this program released together with the paper
 
 "Maximum Filter Vibrato Suppression for Onset Detection"
-by Sebastian Böck and Gerhard Widmer
-in Proceedings of the 16th International Conference on Digital Audio Effects
+Sebastian Böck and Gerhard Widmer.
+Proceedings of the 16th International Conference on Digital Audio Effects
 (DAFx-13), Maynooth, Ireland, September 2013
 
 is not tuned in any way for speed/memory efficiency. However, it can be used
 as a reference implementation for the described onset detection with a maximum
 filter for vibrato suppression.
 
-If you use this software, please cite the paper:
+It also serves as a reference implementation of the local group delay (LGD)
+based weighting extension described in:
 
-@inproceedings{Boeck2013,
-	Author = {B{\"o}ck, Sebastian and Widmer, Gerhard},
-	Title = {Maximum Filter Vibrato Suppression for Onset Detection},
-	Booktitle = {{Proceedings of the 16th International Conference on Digital
-	              Audio Effects (DAFx-13)}},
-	Pages = {55--61},
-	Address = {Maynooth, Ireland},
-	Month = {September},
-	Year = {2013}
-}
+"Local group delay based vibrato and tremolo suppression for onset detection"
+Sebastian Böck and Gerhard Widmer.
+Proceedings of the 13th International Society for Music Information
+Retrieval Conference (ISMIR), 2013.
+
+If you use this software, please cite the corresponding paper.
 
 Please send any comments, enhancements, errata, etc. to the main author.
 
@@ -231,7 +228,8 @@ class Spectrogram(object):
 
     """
     def __init__(self, wav, frame_size=2048, fps=200, filterbank=None,
-                 log=False, mul=1, add=1, online=True, block_size=2048):
+                 log=False, mul=1, add=1, online=True, block_size=2048,
+                 lgd=False):
         """
         Creates a new Spectrogram object instance and performs a STFT on the
         given audio.
@@ -239,12 +237,23 @@ class Spectrogram(object):
         :param wav:        a Wav object
         :param frame_size: the size for the window [samples]
         :param fps:        frames per second
+        :param filterbank: use the given filterbank for dimensionality
+                           reduction
+        :param log:        use logarithmic magnitude
+        :param mul:        multiply the magnitude by this factor before taking
+                           the logarithm
+        :param add:        add this value to the magnitude before taking the
+                           logarithm
         :param online:     work in online mode (i.e. use only past information)
+        :param block_size: perform the filtering in blocks of the given size
+        :param lgd:        compute the local group delay (needed for the
+                           ComplexFlux algorithm)
 
         """
         # init some variables
         self.wav = wav
         self.fps = fps
+        self.filterbank = filterbank
         if add <= 0:
             raise ValueError("a positive value must be added before taking "
                              "the logarithm")
@@ -277,6 +286,11 @@ class Spectrogram(object):
             block = 0
             # init a matrix of that size
             spec = np.zeros([block_size, self.num_fft_bins])
+        # init the local group delay matrix
+        self.lgd = None
+        if lgd:
+            self.lgd = np.zeros([self.num_frames, self.num_fft_bins],
+                                dtype=np.float32)
         # create windowing function for DFT
         self.window = np.hanning(frame_size)
         try:
@@ -317,6 +331,13 @@ class Spectrogram(object):
             signal = signal * self._fft_window
             # perform DFT
             stft = fft.fft(signal)[:self.num_fft_bins]
+            # compute the local group delay
+            if lgd:
+                # unwrap the phase
+                unwrapped_phase = np.unwrap(np.angle(stft))
+                # local group delay is the derivative over frequency
+                self.lgd[frame, :-1] = (unwrapped_phase[:-1] -
+                                        unwrapped_phase[1:])
             # is block-wise processing needed?
             if filterbank is None:
                 # no filtering needed, thus no block wise processing needed
@@ -346,16 +367,21 @@ class SpectralODF(object):
     function based on the magnitude or phase information of a spectrogram.
 
     """
-    def __init__(self, spectrogram, ratio=0.5, max_bins=3, diff_frames=None):
+    def __init__(self, spectrogram, ratio=0.5, max_bins=3, diff_frames=None,
+                 temporal_filter=3, temporal_origin=0):
         """
         Creates a new ODF object instance.
 
-        :param spectrogram: a Spectrogram object on which the detection
-                            functions operate
-        :param ratio:       calculate the difference to the frame which has the
-                            given magnitude ratio
-        :param max_bins:    number of bins for the maximum filter
-        :param diff_frames: calculate the difference to the N-th previous frame
+        :param spectrogram:     a Spectrogram object on which the detection
+                                functions operate
+        :param ratio:           calculate the difference to the frame which
+                                has the given magnitude ratio
+        :param max_bins:        number of bins for the maximum filter
+        :param diff_frames:     calculate the difference to the N-th previous
+                                frame
+        :param temporal_filter: temporal maximum filtering of the local group
+                                delay for the ComplexFlux algorithms
+        :param temporal_origin: origin of the temporal maximum filter
 
         If no diff_frames are given, they are calculated automatically based on
         the given ratio.
@@ -375,15 +401,19 @@ class SpectralODF(object):
         self.diff_frames = diff_frames
         # number of bins used for the maximum filter
         self.max_bins = max_bins
+        self.temporal_filter = temporal_filter
+        self.temporal_origin = temporal_origin
 
-    def diff(self, spec, pos=False, diff_frames=None, max_bins=None):
+    @staticmethod
+    def _superflux_diff_spec(spec, diff_frames=1, max_bins=3):
         """
-        Calculates the difference of the magnitude spectrogram.
+        Calculate the difference spec used for SuperFlux.
 
-        :param spec:        the magnitude spectrogram
-        :param pos:         only keep positive values
+        :param spec:        magnitude spectrogram
         :param diff_frames: calculate the difference to the N-th previous frame
-        :param max_bins:    number of bins over which the maximum is searched
+        :param max_bins:    number of neighboring bins used for maximum
+                            filtering
+        :return:            difference spectrogram used for SuperFlux
 
         Note: If 'max_bins' is greater than 0, a maximum filter of this size
               is applied in the frequency direction. The difference of the
@@ -397,35 +427,123 @@ class SpectralODF(object):
 
         """
         # init diff matrix
-        diff = np.zeros_like(spec)
-        if diff_frames is None:
-            diff_frames = self.diff_frames
-        assert diff_frames >= 1, 'number of diff_frames must be >= 1'
-        # apply the maximum filter if needed
-        if max_bins > 0:
-            max_spec = maximum_filter(spec, size=[1, max_bins])
-        else:
-            max_spec = spec
+        diff_spec = np.zeros_like(spec)
+        if diff_frames < 1:
+            raise ValueError("number of diff_frames must be >= 1")
+        # widen the spectrogram in frequency dimension by `max_bins`
+        max_spec = maximum_filter(spec, size=[1, max_bins])
         # calculate the diff
-        diff[diff_frames:] = spec[diff_frames:] - max_spec[0:-diff_frames]
+        diff_spec[diff_frames:] = spec[diff_frames:] - max_spec[0:-diff_frames]
         # keep only positive values
-        if pos:
-            diff *= (diff > 0)
-        return diff
+        np.maximum(diff_spec, 0, diff_spec)
+        # return diff spec
+        return diff_spec
+
+    @staticmethod
+    def _lgd_mask(spec, lgd, filterbank=None, temporal_filter=0,
+                  temporal_origin=0):
+        """
+        Calculates a weighting mask for the magnitude spectrogram based on the
+        local group delay.
+
+        :param spec:            the magnitude spectrogram
+        :param lgd:             local group delay of the spectrogram
+        :param filterbank:      filterbank used for dimensionality reduction of
+                                the magnitude spectrogram
+        :param temporal_filter: temporal maximum filtering of the local group
+                                delay
+        :param temporal_origin: origin of the temporal maximum filter
+
+        "Local group delay based vibrato and tremolo suppression for onset
+         detection"
+        Sebastian Böck and Gerhard Widmer.
+        Proceedings of the 13th International Society for Music Information
+        Retrieval Conference (ISMIR), 2013.
+
+        """
+        from scipy.ndimage import maximum_filter, minimum_filter
+        # take only absolute values of the local group delay
+        lgd = np.abs(lgd)
+
+        # maximum filter along the temporal axis
+        if temporal_filter > 0:
+            lgd = maximum_filter(lgd, size=[temporal_filter, 1],
+                                 origin=temporal_origin)
+        # lgd = uniform_filter(lgd, size=[1, 3])  # better for percussive onsets
+
+        # create the weighting mask
+        if filterbank is not None:
+            # if the magnitude spectrogram was filtered, use the minimum local
+            # group delay value of each filterbank (expanded by one frequency
+            # bin in both directions) as the mask
+            mask = np.zeros_like(spec)
+            num_bins = lgd.shape[1]
+            for b in range(mask.shape[1]):
+                # determine the corner bins for the mask
+                corner_bins = np.nonzero(filterbank[:, b])[0]
+                # always expand to the next neighbour
+                start_bin = corner_bins[0] - 1
+                stop_bin = corner_bins[-1] + 2
+                # constrain the range
+                if start_bin < 0:
+                    start_bin = 0
+                if stop_bin > num_bins:
+                    stop_bin = num_bins
+                # set mask
+                mask[:, b] = np.amin(lgd[:, start_bin: stop_bin], axis=1)
+        else:
+            # if the spectrogram is not filtered, use a simple minimum filter
+            # covering only the current bin and its neighbours
+            mask = minimum_filter(lgd, size=[1, 3])
+        # return the normalized mask
+        return mask / np.pi
 
     # Onset Detection Functions
     def superflux(self):
         """
-        SuperFlux with a maximum filter trajectory tracking stage.
+        SuperFlux with a maximum filter based vibrato suppression.
+
+        :return: SuperFlux onset detection function
 
         "Maximum Filter Vibrato Suppression for Onset Detection"
-        Sebastian Böck, and Gerhard Widmer
-        Proceedings of the 16th International Conferenceon Digital Audio
+        Sebastian Böck and Gerhard Widmer.
+        Proceedings of the 16th International Conference on Digital Audio
         Effects (DAFx-13), Maynooth, Ireland, September 2013
 
         """
-        return np.sum(self.diff(self.s.spec, pos=True, max_bins=self.max_bins),
-                      axis=1)
+        # compute the difference spectrogram as in the SuperFlux algorithm
+        diff_spec = self._superflux_diff_spec(self.s.spec, self.diff_frames,
+                                              self.max_bins)
+        # sum all positive 1st order max. filtered differences
+        return np.sum(diff_spec, axis=1)
+
+    def complex_flux(self):
+        """
+        Complex Flux with a local group delay based tremolo suppression.
+
+        Calculates the difference of bin k of the magnitude spectrogram
+        relative to the N-th previous frame of the (maximum filtered)
+        spectrogram.
+
+        :return: complex flux onset detection function
+
+        "Local group delay based vibrato and tremolo suppression for onset
+         detection"
+        Sebastian Böck and Gerhard Widmer.
+        Proceedings of the 13th International Society for Music Information
+        Retrieval Conference (ISMIR), 2013.
+
+        """
+        # compute the difference spectrogram as in the SuperFlux algorithm
+        diff_spec = self._superflux_diff_spec(self.s.spec, self.diff_frames,
+                                              self.max_bins)
+        # create a mask based on the local group delay information
+        mask = self._lgd_mask(self.s.spec, self.s.lgd, self.s.filterbank,
+                              self.temporal_filter, self.temporal_origin)
+        # weight the differences with the mask
+        diff_spec *= mask
+        # sum all positive 1st order max. filtered and weighted differences
+        return np.sum(diff_spec, axis=1)
 
 
 class Onset(object):
@@ -545,7 +663,6 @@ class Onset(object):
         Note: using an empty separator ('') results in a binary numpy array.
 
         """
-        print filename, sep
         self.activations.tofile(filename, sep=sep)
 
     def load(self, filename, sep):
@@ -561,9 +678,12 @@ class Onset(object):
         self.activations = np.fromfile(filename, sep=sep)
 
 
-def parser():
+def parser(lgd=False, threshold=1.1):
     """
     Parses the command line arguments.
+
+    :param lgd:       use local group delay weighting by default
+    :param threshold: default value for threshold
 
     """
     import argparse
@@ -571,12 +691,26 @@ def parser():
     p = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter, description="""
     If invoked without any parameters, the software detects all onsets in
-    the given files in online mode according to the method proposed in:
+    the given files according to the method proposed in:
 
     "Maximum Filter Vibrato Suppression for Onset Detection"
-    by Sebastian Böck and Gerhard Widmer
+    Sebastian Böck and Gerhard Widmer.
     Proceedings of the 16th International Conference on Digital Audio Effects
     (DAFx-13), Maynooth, Ireland, September 2013
+
+    If the '--lgd' switch is set, it additionally applies a local group delay
+    based weighting according to the method proposed in:
+
+    "Local group delay based vibrato and tremolo suppression for onset
+     detection"
+    Sebastian Böck and Gerhard Widmer.
+    Proceedings of the 13th International Society for Music Information
+    Retrieval Conference (ISMIR), 2013.
+
+    The single most important parameter is the threshold ('-t'). Adjusting
+    this parameter might help to improve performance considerably. Please note
+    that if the local group delay weighting scheme is applied, the threshold
+    should be adjusted to a lower value, e.g. 0.25.
 
     """)
     # general options
@@ -621,39 +755,48 @@ def parser():
     spec.add_argument('--max_bins', action='store', type=int, default=3,
                       help='bins used for maximum filtering '
                            '[default=%(default)s]')
-    # spec-processing
-    pre = p.add_argument_group('pre-processing arguments')
-    # filter
-    pre.add_argument('--no_filter', dest='filter', action='store_false',
-                     default=True, help='do not filter the magnitude '
-                                        'spectrogram with a filterbank')
-    pre.add_argument('--fmin', action='store', default=30, type=float,
-                     help='minimum frequency of filter '
-                          '[Hz, default=%(default)s]')
-    pre.add_argument('--fmax', action='store', default=17000, type=float,
-                     help='maximum frequency of filter '
-                          '[Hz, default=%(default)s]')
-    pre.add_argument('--bands', action='store', type=int, default=24,
-                     help='number of bands per octave [default=%(default)s]')
-    pre.add_argument('--equal', action='store_true', default=False,
-                     help='equalize triangular windows to have equal area')
-    pre.add_argument('--block_size', action='store', default=2048, type=int,
-                     help='perform filtering in blocks of N frames '
-                          '[default=%(default)s]')
+    # LGD stuff
+    mask = p.add_argument_group('local group delay based weighting')
+    mask.add_argument('--lgd', action='store_true', default=lgd,
+                      help='apply local group delay based weighting '
+                           '[default=%(default)s]')
+    mask.add_argument('--temporal_filter', action='store', default=3, type=int,
+                      help='apply a temporal filter of N frames before '
+                           'calculating the LGD weighting mask '
+                           '[default=%(default)s]')
+    # filtering
+    filt = p.add_argument_group('magnitude spectrogram filtering arguments')
+    filt.add_argument('--no_filter', dest='filter', action='store_false',
+                      default=True, help='do not filter the magnitude '
+                                         'spectrogram with a filterbank')
+    filt.add_argument('--fmin', action='store', default=30, type=float,
+                      help='minimum frequency of filter '
+                           '[Hz, default=%(default)s]')
+    filt.add_argument('--fmax', action='store', default=17000, type=float,
+                      help='maximum frequency of filter '
+                           '[Hz, default=%(default)s]')
+    filt.add_argument('--bands', action='store', type=int, default=24,
+                      help='number of bands per octave [default=%(default)s]')
+    filt.add_argument('--equal', action='store_true', default=False,
+                      help='equalize triangular windows to have equal area')
+    filt.add_argument('--block_size', action='store', default=2048, type=int,
+                      help='perform filtering in blocks of N frames '
+                           '[default=%(default)s]')
     # logarithm
-    pre.add_argument('--no_log', dest='log', action='store_false',
+    log = p.add_argument_group('logarithmic magnitude spectrogram arguments')
+    log.add_argument('--no_log', dest='log', action='store_false',
                      default=True, help='use linear magnitude scale')
-    pre.add_argument('--mul', action='store', default=1, type=float,
+    log.add_argument('--mul', action='store', default=1, type=float,
                      help='multiplier (before taking the log) '
                           '[default=%(default)s]')
-    pre.add_argument('--add', action='store', default=1, type=float,
+    log.add_argument('--add', action='store', default=1, type=float,
                      help='value added (before taking the log) '
                           '[default=%(default)s]')
     # onset detection
-    onset = p.add_argument_group('onset detection arguments')
+    onset = p.add_argument_group('onset peak-picking arguments')
     onset.add_argument('-t', dest='threshold', action='store', type=float,
-                       default=1.1, help='detection threshold '
-                                         '[default=%(default)s]')
+                       default=threshold, help='detection threshold '
+                                               '[default=%(default)s]')
     onset.add_argument('--combine', action='store', type=float, default=0.03,
                        help='combine onsets within N seconds '
                             '[default=%(default)s]')
@@ -674,7 +817,7 @@ def parser():
                             '[default=%(default)s]')
     # version
     p.add_argument('--version', action='version',
-                   version='%(prog)spec 1.02 (2014-11-01)')
+                   version='%(prog)spec 1.03 (2014-11-02)')
     # parse arguments
     args = p.parse_args()
     # print arguments
@@ -684,16 +827,16 @@ def parser():
     return args
 
 
-def main():
+def main(args):
     """
     Main SuperFlux program.
+
+    :param args: parsed arguments
 
     """
     import os.path
     import glob
     import fnmatch
-    # parse arguments
-    args = parser()
     # determine the files to process
     files = []
     for f in args.files:
@@ -713,7 +856,7 @@ def main():
     # process the files
     for f in files:
         if args.verbose:
-            print f
+            print 'processing file %s' % f
         # use the name of the file without the extension
         filename = os.path.splitext(f)[0]
         # do the processing stuff unless the activations are loaded from file
@@ -741,12 +884,18 @@ def main():
                                   args.bands, args.fmin, args.fmax, args.equal)
                     filterbank = filt.filterbank
             # spectrogram
-            s = Spectrogram(w, args.frame_size, args.fps, filterbank, args.log,
-                            args.mul, args.add, args.online, args.block_size)
+            s = Spectrogram(w, frame_size=args.frame_size, fps=args.fps,
+                            filterbank=filterbank, log=args.log,
+                            mul=args.mul, add=args.add, online=args.online,
+                            block_size=args.block_size, lgd=args.lgd)
             # use the spectrogram to create an SpectralODF object
-            sodf = SpectralODF(s, args.ratio, args.max_bins, args.diff_frames)
+            sodf = SpectralODF(s, ratio=args.ratio, max_bins=args.max_bins,
+                               diff_frames=args.diff_frames)
             # perform detection function on the object
-            act = sodf.superflux()
+            if args.lgd:
+                act = sodf.complex_flux()
+            else:
+                act = sodf.superflux()
             # create an Onset object with the activations
             o = Onset(act, args.fps, args.online)
             if args.save:
@@ -763,4 +912,7 @@ def main():
         # continue with next file
 
 if __name__ == '__main__':
-    main()
+    # parse arguments
+    args = parser()
+    # and run the main SuperFlux program
+    main(args)
